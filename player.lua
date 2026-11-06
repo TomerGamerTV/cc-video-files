@@ -1,47 +1,43 @@
 -- player.lua
--- Universal CC:Tweaked Media Player (Videos with Audio, Animated GIFs, and Static Images)
--- Plays `.ccv` files hosted on GitHub (or any Raw HTTP URL) or local disk.
+-- Universal CC:Tweaked Media Player (Videos with Audio, Audio-Only MP3/WAV/DFPWM, Animated GIFs, and Static Images)
+-- Plays `.ccv` and `.dfpwm` files hosted on GitHub (or any Raw HTTP URL) or local disk.
 --
 -- Key Features:
--- 1. Automatic Monitor Scaling:
+-- 1. Automatic HTTP Range Chunked Streaming ("Response is too large" Bypass):
+--    CC:Tweaked limits single HTTP responses to `max_download` (16 MiB by default).
+--    `player.lua` bypasses this completely by streaming remote URLs in 4 MiB byte-range
+--    windows (`Range: bytes=start-end`), allowing arbitrarily long videos/music to play!
+-- 2. Automatic Monitor Scaling:
 --    Detects any attached Monitor, sets `setTextScale(0.5)` for maximum pixel density,
 --    and dynamically scales the video/GIF/image subpixel grid in real time to fit your
 --    exact monitor dimensions (`char_w * 2` x `char_h * 3` subpixels)!
--- 2. Highest Pixel Density & Color Quality:
---    Packs every 2x3 subpixel block into CC:Tweaked's teletext drawing characters (128..159)
---    with per-frame 16-color palette updates.
--- 3. Smooth, Stutter-Free 48kHz DFPWM1a Audio:
---    Buffers and flushes DFPWM1a audio in smooth chunks across all attached speakers in lockstep
---    with video frames, avoiding tiny per-tick buffer underruns.
--- 4. Automatic Looping for Videos and GIFs:
---    Automatically loops both videos and animated GIFs continuously (pass `--once` to play only once),
---    and caches downloaded streams in RAM/disk when possible so loops replay instantly without re-downloading!
+-- 3. Full Audio-Only & Video+Audio Support:
+--    - Plays `.ccv` Audio-Only streams (`flags` bit 3) with a live visualizer on the monitor/terminal.
+--    - Also directly plays raw `.dfpwm` audio URLs or local files out of the box!
+-- 4. Automatic Looping for Videos, Audio, and GIFs:
+--    Automatically loops continuously (pass `--once` to play only once).
 --
 -- Usage on PebbleHost / CC:Tweaked:
 --   player <github_url_or_local_file> [--once]
--- Examples:
---   player https://github.com/user/repo/blob/main/video.ccv
---   player https://raw.githubusercontent.com/user/repo/main/anim.gif.ccv
---   player https://raw.githubusercontent.com/user/repo/main/photo.ccv
 
 local args = { ... }
 if #args < 1 then
     print("Usage:")
     print("  player <github_url_or_file> [--once]")
-    print("Examples:")
-    print("  player https://raw.githubusercontent.com/user/repo/main/video.ccv")
-    print("  player https://github.com/user/repo/blob/main/image.ccv")
+    print("Supported formats:")
+    print("  - .ccv (Video+Audio, Audio-Only, Animated GIF, Static Image)")
+    print("  - .dfpwm (Raw DFPWM1a Audio)")
     return
 end
 
 local source = args[1]
 local play_once = (args[2] == "--once")
 
--- Automatically convert standard GitHub `/blob/` links into `raw.githubusercontent.com` links
+-- Normalize any GitHub URL (/blob/ or /raw/refs/heads/ or /raw/) into direct `raw.githubusercontent.com`
 local function normalize_github_url(url)
-    if string.match(url, "^https?://github%.com/[^/]+/[^/]+/blob/") then
-        url = string.gsub(url, "^https?://github%.com/([^/]+)/([^/]+)/blob/", "https://raw.githubusercontent.com/%1/%2/")
-    end
+    url = string.gsub(url, "^https?://github%.com/([^/]+)/([^/]+)/blob/", "https://raw.githubusercontent.com/%1/%2/")
+    url = string.gsub(url, "^https?://github%.com/([^/]+)/([^/]+)/raw/refs/heads/", "https://raw.githubusercontent.com/%1/%2/")
+    url = string.gsub(url, "^https?://github%.com/([^/]+)/([^/]+)/raw/", "https://raw.githubusercontent.com/%1/%2/")
     return url
 end
 
@@ -91,7 +87,7 @@ local function restore_display()
     display.setCursorPos(1, 1)
 end
 
--- Precompute hex lookup and byte lookup tables for blazing-fast Lua rendering
+-- Precompute hex lookup and byte lookup tables for fast Lua rendering
 local HEX_CHAR = {
     [0] = "0", [1] = "1", [2] = "2", [3] = "3",
     [4] = "4", [5] = "5", [6] = "6", [7] = "7",
@@ -112,8 +108,126 @@ for b = 0, 255 do
 end
 
 local str_byte = string.byte
+local str_sub = string.sub
 local tbl_concat = table.concat
 local math_floor = math.floor
+
+-- =============================================================================
+-- Chunked HTTP Byte-Range Reader (Bypasses CC:Tweaked "Response is too large"!)
+-- Fetches remote files in 4 MiB slices (`Range: bytes=start-end`) seamlessly.
+-- =============================================================================
+local RANGE_CHUNK_SIZE = 4 * 1024 * 1024 -- 4 MiB per HTTP Range request (well below 16 MiB limit)
+
+local function open_binary_stream(path_or_url)
+    if not string.match(path_or_url, "^https?://") then
+        local f, err = fs.open(path_or_url, "rb")
+        if not f then
+            error("Could not open local file " .. path_or_url .. ": " .. tostring(err))
+        end
+        return f
+    end
+
+    -- State for chunked HTTP Range reader
+    local current_offset = 0
+    local total_size = nil
+    local buffer = ""
+    local buf_pos = 1
+    local eof = false
+
+    local function fetch_next_chunk()
+        if eof then return false end
+        if total_size and current_offset >= total_size then
+            eof = true
+            return false
+        end
+
+        local range_end = current_offset + RANGE_CHUNK_SIZE - 1
+        if total_size and range_end >= total_size then
+            range_end = total_size - 1
+        end
+
+        local headers = {
+            ["Range"] = string.format("bytes=%d-%d", current_offset, range_end),
+            ["Cache-Control"] = "no-cache",
+        }
+
+        local resp, err = http.get(path_or_url, headers, true)
+        if not resp then
+            -- Fallback: if server doesn't support Range and file is small, try plain http.get on offset 0
+            if current_offset == 0 then
+                resp, err = http.get(path_or_url, nil, true)
+            end
+            if not resp then
+                error("HTTP request failed for " .. path_or_url .. ": " .. tostring(err))
+            end
+        end
+
+        local resp_headers = resp.getResponseHeaders and resp.getResponseHeaders() or {}
+        for k, v in pairs(resp_headers) do
+            if string.lower(k) == "content-range" then
+                local total_str = string.match(v, "/(%d+)")
+                if total_str then
+                    total_size = tonumber(total_str)
+                end
+            end
+        end
+
+        local chunk_data = resp.readAll()
+        resp.close()
+
+        if not chunk_data or #chunk_data == 0 then
+            eof = true
+            return false
+        end
+
+        current_offset = current_offset + #chunk_data
+        if total_size and current_offset >= total_size then
+            eof = true
+        elseif #chunk_data < RANGE_CHUNK_SIZE and not total_size then
+            -- Server returned entire remaining body
+            eof = true
+        end
+
+        buffer = chunk_data
+        buf_pos = 1
+        return true
+    end
+
+    local reader = {}
+
+    function reader.read(n)
+        n = n or 1
+        local out = {}
+        local needed = n
+
+        while needed > 0 do
+            local avail = #buffer - buf_pos + 1
+            if avail <= 0 then
+                if not fetch_next_chunk() then
+                    break
+                end
+                avail = #buffer - buf_pos + 1
+            end
+
+            local take = (needed < avail) and needed or avail
+            out[#out + 1] = str_sub(buffer, buf_pos, buf_pos + take - 1)
+            buf_pos = buf_pos + take
+            needed = needed - take
+        end
+
+        if #out == 0 then
+            return nil
+        end
+        return tbl_concat(out)
+    end
+
+    function reader.close()
+        buffer = ""
+        eof = true
+    end
+
+    return reader
+end
 
 -- Apply 48-byte RGB palette (16 colors x 3 bytes)
 local function apply_palette(palette_bytes, RGB_FLAT)
@@ -284,25 +398,70 @@ local function render_scaled_ccv2_frame(packed_bytes, RGB_FLAT, scaler, char_w, 
     end
 end
 
--- Open either an HTTP/HTTPS URL or a local file on disk in binary mode
-local function open_binary_stream(path_or_url)
-    if string.match(path_or_url, "^https?://") then
-        local resp, err = http.get(path_or_url, nil, true)
-        if not resp then
-            error("HTTP request failed for " .. path_or_url .. ": " .. tostring(err))
+-- Simple audio-only visualizer on the display
+local function render_audio_visualizer(samples, char_w, char_h, elapsed_sec)
+    display.setBackgroundColor(colors.black)
+    display.clear()
+    local mid_y = math_floor(char_h / 2)
+    display.setCursorPos(2, 2)
+    display.setTextColor(colors.cyan)
+    display.write(string.format("Playing Audio Stream (%.1fs)", elapsed_sec))
+
+    if not samples or #samples == 0 then return end
+    local step = math.max(1, math_floor(#samples / char_w))
+    for x = 1, char_w do
+        local s = samples[(x - 1) * step + 1] or 0
+        local amp = math_floor((math.abs(s) / 128.0) * (char_h / 2 - 2))
+        local y_top = math.max(3, mid_y - amp)
+        local y_bot = math.min(char_h - 1, mid_y + amp)
+        for y = y_top, y_bot do
+            display.setCursorPos(x, y)
+            display.setBackgroundColor((y == mid_y) and colors.lightBlue or colors.blue)
+            display.write(" ")
         end
-        return resp
-    else
-        local f, err = fs.open(path_or_url, "rb")
-        if not f then
-            error("Could not open local file " .. path_or_url .. ": " .. tostring(err))
-        end
-        return f
     end
+    display.setBackgroundColor(colors.black)
+end
+
+-- Play a raw `.dfpwm` file or stream directly
+local function play_raw_dfpwm_stream(handle)
+    local decoder = (has_dfpwm and dfpwm) and dfpwm.make_decoder() or nil
+    if not decoder or #speakers == 0 then
+        handle.close()
+        error("No speaker or cc.audio.dfpwm available for audio playback.")
+    end
+
+    if mon then mon.setTextScale(0.5) end
+    local char_w, char_h = display.getSize()
+    local elapsed = 0.0
+    local chunk_size = 6000 -- 1.0s of 48kHz DFPWM audio (48,000 samples)
+
+    while true do
+        local chunk = handle.read(chunk_size)
+        if not chunk or #chunk == 0 then break end
+        local samples = decoder(chunk)
+        render_audio_visualizer(samples, char_w, char_h, elapsed)
+        elapsed = elapsed + (#chunk / 6000.0)
+
+        for _, spk in ipairs(speakers) do
+            while not spk.playAudio(samples, 3.0) do
+                os.pullEvent("speaker_audio_empty")
+            end
+        end
+    end
+
+    handle.close()
+    return false
 end
 
 local function play_stream_once(path_or_url)
     local handle = open_binary_stream(path_or_url)
+
+    -- If URL/path ends with .dfpwm, play directly as raw DFPWM audio
+    if string.match(string.lower(path_or_url), "%.dfpwm$") then
+        return play_raw_dfpwm_stream(handle)
+    end
+
     local magic = handle.read(4)
     if magic ~= "CCV2" then
         handle.close()
@@ -317,16 +476,13 @@ local function play_stream_once(path_or_url)
 
     local has_audio = (flags % 2) == 1
     local is_static_image = (math_floor(flags / 2) % 2) == 1
+    local is_audio_only = (math_floor(flags / 8) % 2) == 1 or (src_sub_w == 0 and src_sub_h == 0)
 
     -- Fresh DFPWM decoder instance for each playback pass so filter state starts clean
     local decoder = (has_dfpwm and dfpwm) and dfpwm.make_decoder() or nil
     local pending_audio_chunks = {}
     local pending_audio_bytes = 0
 
-    -- Helper to flush accumulated DFPWM bytes to all attached speakers
-    -- CC:Tweaked's speaker buffer holds up to 0.5s (3,000 DFPWM bytes = 24,000 samples).
-    -- Grouping 4 frames (0.20s = 1,200 DFPWM bytes = 9,600 samples) prevents per-tick packet
-    -- overhead and eliminates audio stutter on multiplayer servers like PebbleHost.
     local function flush_audio(force)
         if #speakers == 0 or not decoder or pending_audio_bytes == 0 then
             return
@@ -346,11 +502,42 @@ local function play_stream_once(path_or_url)
             pending_audio_chunks = {}
             pending_audio_bytes = 0
         end
+        return samples
     end
 
-    -- Re-check monitor dimensions right before playback (in case monitor was resized)
     if mon then mon.setTextScale(0.5) end
     local char_w, char_h = display.getSize()
+
+    -- Handle CCV2 Audio-Only mode (`is_audio_only`)
+    if is_audio_only then
+        local elapsed = 0.0
+        while true do
+            local chunk_type_str = handle.read(1)
+            if not chunk_type_str or str_byte(chunk_type_str, 1) == 0xFF then break end
+            local alen_str = handle.read(2)
+            if not alen_str or #alen_str < 2 then break end
+            local audio_len = str_byte(alen_str, 1) * 256 + str_byte(alen_str, 2)
+            if audio_len > 0 then
+                local audio_data = handle.read(audio_len)
+                if not audio_data then break end
+                if decoder and #speakers > 0 then
+                    local samples = decoder(audio_data)
+                    render_audio_visualizer(samples, char_w, char_h, elapsed)
+                    elapsed = elapsed + (#audio_data / 6000.0)
+                    for _, spk in ipairs(speakers) do
+                        while not spk.playAudio(samples, 3.0) do
+                            os.pullEvent("speaker_audio_empty")
+                        end
+                    end
+                else
+                    sleep(#audio_data / 6000.0)
+                end
+            end
+        end
+        handle.close()
+        return false
+    end
+
     local scaler = build_Monitor_Scaler(src_sub_w, src_sub_h, char_w, char_h)
     local packed_frame_bytes = math_floor((src_sub_w * src_sub_h) / 2)
     local RGB_FLAT = {}
@@ -382,8 +569,6 @@ local function play_stream_once(path_or_url)
         if has_audio and audio_data and #audio_data > 0 then
             pending_audio_chunks[#pending_audio_chunks + 1] = audio_data
             pending_audio_bytes = pending_audio_bytes + #audio_data
-            -- Flush immediately on the very first frame so audio starts right away,
-            -- then flush every ~0.2s (1,200 bytes) thereafter
             flush_audio(frame_index == 0)
         end
 
@@ -411,7 +596,7 @@ local function play_stream_once(path_or_url)
     return is_static_image
 end
 
--- Main execution loop: loops all videos and GIFs continuously unless `--once` is passed!
+-- Main execution loop: loops all videos, audio, and GIFs continuously unless `--once` is passed!
 local ok, err = pcall(function()
     print("Playing (loops automatically; press Ctrl+T to stop)...")
     while true do
@@ -423,7 +608,6 @@ local ok, err = pcall(function()
         elseif play_once then
             break
         else
-            -- Brief yield before restarting the video/GIF loop
             sleep(0.05)
         end
     end
